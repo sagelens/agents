@@ -18,9 +18,11 @@ from google.genai import errors, types
 from .agents import AgentSpec
 # Import the low-level tool registry and declarations.
 from .tools import TOOL_DECLARATIONS, TOOL_FUNCTIONS
+from .logging_config import get_logger, log
 
 # Retry one provider-side error after SDK retries finish.
 MODEL_API_ATTEMPTS = 2
+LOGGER = get_logger("runtime")
 
 
 # Return a stable UTC timestamp.
@@ -102,10 +104,14 @@ def run_specialist(
     context: str,
     trace_id: str,
     parent_step_id: str,
+    fallback_model: str | None = None,
+    fallback_after_failures: int = 2,
 ) -> dict:
     """Execute a specialist and return its result plus hierarchical events."""
     # Give this invocation an identity independent from the user turn.
     agent_run_id = str(uuid4())
+    log(LOGGER, "INFO", "Specialist invocation started", agent=spec.name,
+        agent_run_id=agent_run_id)
     # Create a separate client so parallel specialists do not share mutable SDK state.
     client = genai.Client(api_key=api_key)
     # Start end-to-end specialist timing.
@@ -116,6 +122,8 @@ def run_specialist(
     evidence = []
     # Move directly to synthesis after a non-correctable environment failure.
     force_synthesis = False
+    active_model = model
+    primary_model_failures = 0
     # Format the focused, stateless specialist input.
     initial_text = f"Task:\n{task}\n\nRelevant context:\n{context or 'None'}"
     # Start a new specialist conversation with no coordinator history.
@@ -159,13 +167,18 @@ def run_specialist(
         model_started = perf_counter()
         # Start without a response for retry control.
         response = None
-        # Retry one provider-side server failure.
-        for attempt in range(1, MODEL_API_ATTEMPTS + 1):
+        # Reserve extra attempts only while a fallback remains available.
+        attempt_limit = MODEL_API_ATTEMPTS + (
+            MODEL_API_ATTEMPTS if fallback_model and active_model == model else 0
+        )
+        for attempt in range(1, attempt_limit + 1):
             # Convert provider errors into specialist events.
             try:
+                log(LOGGER, "DEBUG", "Calling specialist model", agent=spec.name,
+                    call_number=call_number, gathering=gathering)
                 # Call Gemma with this specialist's prompt and tools.
                 response = client.models.generate_content(
-                    model=model,
+                    model=active_model,
                     contents=request_contents,
                     config=current_config,
                 )
@@ -173,6 +186,11 @@ def run_specialist(
                 break
             # Catch Gemini API errors.
             except errors.APIError as error:
+                if active_model == model:
+                    primary_model_failures += 1
+                log(LOGGER, "ERROR", "Specialist model call failed", agent=spec.name,
+                    model=active_model, status_code=error.code, attempt=attempt,
+                    primary_failures=primary_model_failures)
                 # Record the failed granular interaction.
                 events.append(
                     {
@@ -186,13 +204,25 @@ def run_specialist(
                         "number": call_number,
                         "attempt": attempt,
                         "status_code": error.code,
+                        "model": active_model,
                         "error": str(error),
                         "latency_ms": round((perf_counter() - model_started) * 1000, 2),
                         "timestamp": now(),
                     }
                 )
+                if (
+                    fallback_model
+                    and active_model == model
+                    and primary_model_failures >= fallback_after_failures
+                ):
+                    active_model = fallback_model
+                    log(LOGGER, "WARN", "Switching specialist to fallback model",
+                        agent=spec.name, primary_model=model,
+                        fallback_model=fallback_model,
+                        failures=primary_model_failures)
+                    continue
                 # Retry only server failures with an attempt remaining.
-                if error.code >= 500 and attempt < MODEL_API_ATTEMPTS:
+                if error.code >= 500 and attempt < attempt_limit:
                     # Pause briefly before retrying.
                     sleep(1)
                     # Retry the same call.
@@ -235,6 +265,7 @@ def run_specialist(
                 "type": "model_call",
                 "number": call_number,
                 "decision": "call_tool" if function_calls else "final_answer",
+                "model": active_model,
                 "tool_names": [call.name for call in function_calls],
                 "latency_ms": round((perf_counter() - model_started) * 1000, 2),
                 "tokens": token_usage(response),
@@ -251,6 +282,8 @@ def run_specialist(
                 and item["result"].get("ok") is False
                 for item in evidence
             )
+            log(LOGGER, "INFO", "Specialist produced final answer", agent=spec.name,
+                status="partial" if partial else "completed")
             # Return the complete specialist result.
             return _specialist_result(
                 spec,
@@ -286,15 +319,21 @@ def run_specialist(
             if tool is None:
                 # Return a safe observation.
                 result = {"ok": False, "error": f"Tool not allowed for {spec.name}: {call.name}"}
+                log(LOGGER, "WARN", "Specialist requested disallowed tool",
+                    agent=spec.name, tool=call.name)
             else:
                 # Convert tool exceptions into observations.
                 try:
+                    log(LOGGER, "INFO", "Executing specialist tool",
+                        agent=spec.name, tool=call.name)
                     # Execute only the validated function.
                     result = tool(**arguments)
                 # Keep one tool failure from crashing the specialist.
                 except Exception as error:
                     # Return a structured failure.
                     result = {"ok": False, "error": str(error)}
+                    log(LOGGER, "ERROR", "Specialist tool failed", agent=spec.name,
+                        tool=call.name, error=str(error))
             # Store structured evidence.
             evidence.append({"tool": call.name, "arguments": arguments, "result": result})
             # Detect failures that changed Python code or another tool call cannot repair.

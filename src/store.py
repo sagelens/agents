@@ -17,6 +17,8 @@ RESUME_SCREENING_FILE = DATA_DIRECTORY / "resume_screening_runs.jsonl"
 OUTREACH_FILE = DATA_DIRECTORY / "outreach_runs.jsonl"
 # Save resumable DAG runs separately from public conversation history.
 WORKFLOWS_DIRECTORY = DATA_DIRECTORY / "workflows"
+# Persist iterative research independently from public chat sessions.
+RESEARCH_DIRECTORY = DATA_DIRECTORY / "research"
 
 
 # Load one session's message history.
@@ -83,4 +85,21 @@ def load_workflow_run(run_id: str) -> dict:
     path = WORKFLOWS_DIRECTORY / f"{run_id}.json"
     if not path.exists():
         raise ValueError(f"Unknown workflow run: {run_id}")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_research_run(run: dict) -> None:
+    """Atomically persist one active or completed deep-research run."""
+    RESEARCH_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    path = RESEARCH_DIRECTORY / f"{run['run_id']}.json"
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(run, indent=2, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
+
+
+def load_research_run(run_id: str) -> dict:
+    """Load a deep-research run by its application-generated identifier."""
+    path = RESEARCH_DIRECTORY / f"{run_id}.json"
+    if not path.exists():
+        raise ValueError(f"Unknown research run: {run_id}")
     return json.loads(path.read_text(encoding="utf-8"))

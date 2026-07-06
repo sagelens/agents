@@ -3,6 +3,7 @@
 # Import operating-system environment variables.
 import os
 import json
+import sys
 from pathlib import Path
 # Import UUID generation for a new conversation.
 from uuid import uuid4
@@ -24,13 +25,20 @@ from src.resume_security import save_security_override
 from src.google_workspace import GoogleWorkspace
 # Import optional Phoenix lifecycle helpers.
 from src.telemetry import configure_telemetry, shutdown_telemetry
+from src.deep_research import (
+    pending_checkpoint,
+    resume_deep_research,
+    select_research_direction,
+    start_deep_research,
+)
+from src.gui import serve_gui
 
 # Load variables from the project .env when it exists.
 load_dotenv()
 
 
 # Keep startup and interactive input separate from import-time behavior.
-def main() -> None:
+def cli_main() -> None:
     """Start one persistent multi-turn terminal session."""
     # Read the secret only from the environment.
     api_key = os.getenv("GEMINI_API_KEY")
@@ -49,7 +57,8 @@ def main() -> None:
     # Explain the only local exit command.
     print(
         "Ask a question, type exit, use /workflow path/to/workflow.json, "
-        "use /screen-resumes, /resume-security-review, or /outreach-shortlisted."
+        "use /research <query>, /research-resume <run-id>, /screen-resumes, "
+        "/resume-security-review, or /outreach-shortlisted."
     )
     # Continue accepting user turns until explicitly stopped.
     while True:
@@ -62,6 +71,44 @@ def main() -> None:
         # Ignore empty terminal submissions.
         if not user_text:
             # Return to the prompt without calling the model.
+            continue
+        if user_text.startswith("/research ") or user_text.startswith(
+            "/research-resume "
+        ):
+            try:
+                if user_text.startswith("/research-resume "):
+                    run_id = user_text.removeprefix("/research-resume ").strip()
+                    research = resume_deep_research(run_id)
+                else:
+                    query = user_text.removeprefix("/research ").strip()
+                    research = start_deep_research(api_key, model, query)
+                while research["status"] == "waiting_for_human":
+                    checkpoint = pending_checkpoint(research)
+                    if checkpoint is None:
+                        break
+                    print(f"\nResearch directions [run={research['run_id']}]:")
+                    for index, option in enumerate(checkpoint["options"], start=1):
+                        print(f"{index}. {option['label']} — {option['outcome']}")
+                    choice = input("Select one direction number (or type exit): ").strip()
+                    if choice.lower() in {"exit", "quit"}:
+                        print(f"Research paused. Resume with /research-resume {research['run_id']}")
+                        break
+                    try:
+                        option_number = int(choice)
+                    except ValueError:
+                        print("Enter one of the displayed direction numbers.")
+                        continue
+                    feedback = input(
+                        "Optional guidance or correction (press Enter to skip): "
+                    ).strip()
+                    research = select_research_direction(
+                        api_key, model, research, option_number, feedback
+                    )
+                if research["status"] == "completed":
+                    print(f"\n{research['final_report']}")
+                    print(f"\n[research_run={research['run_id']}]")
+            except Exception as error:
+                print(f"\nResearch failed: {error}")
             continue
         # Execute an explicit DAG definition from a readable JSON file.
         if user_text.startswith("/workflow "):
@@ -260,13 +307,20 @@ def main() -> None:
         )
 
 
-# Run the CLI only when this file is executed directly.
-if __name__ == "__main__":
-    # Flush optional telemetry even when the user interrupts the CLI.
+def main() -> None:
+    """Start the local GUI by default, or preserve the terminal with --cli."""
+    if "--cli" in sys.argv:
+        cli_main()
+        return
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("Set GEMINI_API_KEY in .env first.")
+    configure_telemetry()
     try:
-        # Invoke the command-line application.
-        main()
-    # Always give the local exporter a chance to send final spans.
+        serve_gui(port=int(os.getenv("AGENT_GUI_PORT", "9999")))
     finally:
-        # Keep shutdown best-effort.
         shutdown_telemetry()
+
+
+if __name__ == "__main__":
+    main()

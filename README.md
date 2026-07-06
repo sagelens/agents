@@ -47,7 +47,30 @@ dataset loading through Phoenix REST persistence, read
    docker build -t agents-python-sandbox:1 sandbox
    ```
 
-8. Run the agent: `python main.py`
+8. Run the local GUI: `python main.py`
+9. Open `http://localhost:9999`.
+
+The GUI accepts general questions and dynamically routes them through the
+coordinator's research, codebase, or data-science specialists. Queries needing
+iterative investigation enter the deep-research HITL flow. Debug Mode displays
+routing, coordinator, model, tool, compaction, and lifecycle events. The server
+binds to `127.0.0.1` and is intended for local development.
+
+The interface uses a collapsible trace inspector on the left and a live,
+color-coded log stream on the right. Structured runtime logs use `DEBUG`,
+`INFO`, `WARN`, `ERROR`, and `FATAL` levels and are also printed to the
+terminal.
+
+Deep-research direction generation, memory updates, specialist calls, and
+final synthesis start on `GEMINI_MODEL` and switch to
+`DEEP_RESEARCH_FALLBACK_MODEL` (default `gemini-2.5-flash`) after two provider
+failures. The fallback does not affect other workflows.
+
+To use the original terminal interface instead:
+
+```bash
+python main.py --cli
+```
 
 Optional Phoenix quickstart:
 
@@ -119,6 +142,41 @@ Run the documented example from the interactive terminal:
 Start with [docs/LEARNING_GUIDE.md](docs/LEARNING_GUIDE.md). It follows the
 low-level execution from JSON parsing through validation, scheduling,
 specialist calls, agent messages, approvals, persistence, and final results.
+
+## Iterative deep research
+
+Start a resumable, human-directed web research session:
+
+```text
+/research How will agent interoperability affect enterprise software?
+```
+
+At each pause, select one of four research directions and optionally add
+guidance. After at least one research round, one direction finishes and
+synthesizes the cited report. Leave the prompt with `exit` and continue later:
+
+```text
+/research-resume <run-id>
+```
+
+Runs are stored in `data/research/`. Stateless research specialists receive
+only the selected focus and compact research memory; raw interaction history
+does not enter the coordinator prompt. Active context is compacted when
+`DEEP_RESEARCH_COMPACTION_TOKENS` is reached.
+
+For a complete beginner-friendly walkthrough of the code, state machine,
+Tree-of-Thought branching, HITL handoffs, source provenance, and dynamic
+compaction, read [docs/DEEP_RESEARCH_AGENT.md](docs/DEEP_RESEARCH_AGENT.md).
+
+For a line-by-line explanation of a real multi-agent weather-to-chart trace,
+including routing, dependent delegation, retries, tools, sandbox execution,
+tokens, persistence, and parent/child event IDs, read
+[docs/TRACE_EXECUTION_WALKTHROUGH.md](docs/TRACE_EXECUTION_WALKTHROUGH.md).
+
+For a real deep-research trace covering HITL Tree-of-Thought choices,
+Gemma-to-Flash fallback, source merging, recursive memory updates, and a
+detailed explanation of dynamic compaction in agent harnesses, read
+[docs/DEEP_RESEARCH_TRACE_AND_COMPACTION.md](docs/DEEP_RESEARCH_TRACE_AND_COMPACTION.md).
 
 ## Resume screening
 

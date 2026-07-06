@@ -9,6 +9,7 @@ from .prompt import (
     CANDIDATE_OUTREACH_PROMPT,
     CODEBASE_PROMPT,
     DATA_SCIENCE_PROMPT,
+    DEEP_RESEARCH_PROMPT,
     RESEARCH_PROMPT,
     RESUME_INGESTION_PROMPT,
     RESUME_SECURITY_GUARD_PROMPT,
@@ -47,6 +48,17 @@ RESEARCH_AGENT = AgentSpec(
     instructions=RESEARCH_PROMPT,
     tool_names=("get_weather", "web_search"),
     handoff_targets=("codebase_agent", "data_science_agent"),
+)
+
+# Give iterative research sessions a distinct, web-only stateless worker.
+DEEP_RESEARCH_AGENT = AgentSpec(
+    name="deep_research_agent",
+    description=(
+        "Investigates one human-selected deep-research direction using grounded "
+        "web evidence and returns control to its coordinator."
+    ),
+    instructions=DEEP_RESEARCH_PROMPT,
+    tool_names=("web_search",),
 )
 
 # Give repository access only to the codebase specialist.
@@ -117,6 +129,7 @@ EMAIL_DELIVERY_AGENT = AgentSpec(
 # Provide one registry for validated coordinator delegation.
 AGENT_SPECS = {
     RESEARCH_AGENT.name: RESEARCH_AGENT,
+    DEEP_RESEARCH_AGENT.name: DEEP_RESEARCH_AGENT,
     CODEBASE_AGENT.name: CODEBASE_AGENT,
     DATA_SCIENCE_AGENT.name: DATA_SCIENCE_AGENT,
     RESUME_INGESTION_AGENT.name: RESUME_INGESTION_AGENT,
