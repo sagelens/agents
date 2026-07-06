@@ -1,4 +1,13 @@
 google-genai>=1.0.0
+google-auth>=2.35.0
+google-auth-oauthlib>=1.2.1
+google-api-python-client>=2.150.0
 python-dotenv>=1.0.0
 requests>=2.32.0
 ddgs>=9.0.0
+pypdf>=5.0.0
+pymupdf>=1.24.0
+arize-phoenix-client>=1.0.0
+arize-phoenix-evals>=3.0.0
+arize-phoenix-otel>=0.16.0
+pandas>=2.2.0

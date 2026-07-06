@@ -11,6 +11,12 @@ DATA_DIRECTORY = Path(__file__).parent.parent / "data"
 SESSIONS_DIRECTORY = DATA_DIRECTORY / "sessions"
 # Append every completed turn to one event log.
 TRAJECTORY_FILE = DATA_DIRECTORY / "trajectories.jsonl"
+# Append privacy-bounded resume screening audits separately from chat turns.
+RESUME_SCREENING_FILE = DATA_DIRECTORY / "resume_screening_runs.jsonl"
+# Append outreach state transitions without storing message bodies.
+OUTREACH_FILE = DATA_DIRECTORY / "outreach_runs.jsonl"
+# Save resumable DAG runs separately from public conversation history.
+WORKFLOWS_DIRECTORY = DATA_DIRECTORY / "workflows"
 
 
 # Load one session's message history.
@@ -46,3 +52,35 @@ def append_trajectory(trajectory: dict) -> None:
     with TRAJECTORY_FILE.open("a", encoding="utf-8") as file:
         # Store one compact JSON object per line for easy streaming later.
         file.write(json.dumps(trajectory, ensure_ascii=False) + "\n")
+
+
+def append_resume_screening_run(run: dict) -> None:
+    """Persist metrics and events without duplicating candidate result rows."""
+    DATA_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    safe_run = {key: value for key, value in run.items() if key != "results"}
+    with RESUME_SCREENING_FILE.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(safe_run, ensure_ascii=False) + "\n")
+
+
+def append_outreach_run(run: dict) -> None:
+    """Append metadata-only outreach events."""
+    DATA_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    with OUTREACH_FILE.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(run, ensure_ascii=False) + "\n")
+
+
+def save_workflow_run(run: dict) -> None:
+    """Persist one complete or paused workflow as readable JSON."""
+    WORKFLOWS_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    path = WORKFLOWS_DIRECTORY / f"{run['run_id']}.json"
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(run, indent=2, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
+
+
+def load_workflow_run(run_id: str) -> dict:
+    """Load a previously persisted workflow dictionary."""
+    path = WORKFLOWS_DIRECTORY / f"{run_id}.json"
+    if not path.exists():
+        raise ValueError(f"Unknown workflow run: {run_id}")
+    return json.loads(path.read_text(encoding="utf-8"))

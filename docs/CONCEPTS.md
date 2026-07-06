@@ -11,6 +11,17 @@ The model is therefore the decision-maker, while the Python runtime is the
 authority. The runtime validates tool names, controls network access, measures
 calls, and decides when execution must stop.
 
+## Multi-agent system
+
+A multi-agent system composes several separately prompted model invocations.
+This project uses one coordinator and three stateless specialists. Each
+specialist has a narrow tool allowlist, while the coordinator owns public
+memory, delegation, and final synthesis.
+
+“Agent” does not imply a separate process or model provider. Each specialist
+is a fresh Gemma invocation with a distinct role, context boundary, tools,
+result contract, and trace identity.
+
 ## ReAct
 
 ReAct means interleaving reasoning and acting:
@@ -110,6 +121,21 @@ observations reduce token use, latency, irrelevant context, and secret exposure.
 The search pattern may be a regular expression. Fixed-string mode should be
 used for symbols containing punctuation or whenever regex behavior is
 unnecessary.
+
+## Generated code and sandbox execution
+
+`run_python` is a code-execution tool. Gemma writes a complete short program,
+but the host application—not the model—decides how it runs. The application
+passes source through standard input to a fresh Docker container and returns
+observable output.
+
+The sandbox image contains NumPy, pandas, SciPy, matplotlib, seaborn, and
+scikit-learn. Matplotlib uses the non-interactive `Agg` backend, so generated
+charts must be saved beneath `/output` instead of displayed with `plt.show()`.
+
+Docker isolation reduces risk but is not a perfect security boundary. This
+design is intended for a local single-user learning agent rather than hostile
+multi-tenant code execution.
 
 ## Sources
 

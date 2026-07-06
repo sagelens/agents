@@ -1,0 +1,29 @@
+services:
+  # Initialize the named volume because Docker creates it as root.
+  phoenix-volume-init:
+    # Use a tiny pinned image for the one-time ownership change.
+    image: busybox:1.36.1
+    # Give Phoenix's fixed non-root UID ownership of its data directory.
+    command: ["sh", "-c", "chown -R 65532:65532 /mnt/data"]
+    # Mount the same persistent data volume.
+    volumes:
+      - phoenix_data:/mnt/data
+
+  phoenix:
+    image: arizephoenix/phoenix:version-17.5.0-nonroot
+    # Start only after the volume is writable by Phoenix's non-root UID.
+    depends_on:
+      phoenix-volume-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:6006:6006"
+      - "127.0.0.1:4317:4317"
+    environment:
+      PHOENIX_WORKING_DIR: /mnt/data
+      PHOENIX_TELEMETRY_ENABLED: "false"
+      PHOENIX_ALLOW_EXTERNAL_RESOURCES: "false"
+    volumes:
+      - phoenix_data:/mnt/data
+
+volumes:
+  phoenix_data:

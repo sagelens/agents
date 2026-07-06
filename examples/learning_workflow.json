@@ -1,0 +1,52 @@
+{
+  "goal": "Inspect this repository, compare approaches, obtain human approval, and hand the final task to the data science agent.",
+  "nodes": [
+    {
+      "node_id": "inspect_code",
+      "type": "agent",
+      "config": {
+        "agent": "codebase_agent",
+        "task": "Find the workflow and protocol implementation and explain their responsibilities."
+      }
+    },
+    {
+      "node_id": "compare_designs",
+      "type": "tree_search",
+      "depends_on": ["inspect_code"],
+      "config": {
+        "problem": "Choose a simple way to present the architecture to a beginner.",
+        "branches": 2,
+        "levels": 1
+      }
+    },
+    {
+      "node_id": "human_gate",
+      "type": "human_approval",
+      "depends_on": ["compare_designs"],
+      "config": {
+        "action": "Continue to the handoff demonstration",
+        "reason": "The next node transfers active task ownership to a specialist."
+      }
+    },
+    {
+      "node_id": "specialist_handoff",
+      "type": "handoff",
+      "depends_on": ["human_gate"],
+      "config": {
+        "source": "codebase_agent",
+        "destination": "data_science_agent",
+        "task": "Summarize the dependency results without executing Python.",
+        "reason": "Demonstrate explicit agent ownership transfer.",
+        "return_policy": "return_to_coordinator"
+      }
+    },
+    {
+      "node_id": "final_join",
+      "type": "join",
+      "depends_on": ["inspect_code", "compare_designs", "specialist_handoff"],
+      "config": {
+        "instruction": "Collect all successful outputs for final presentation."
+      }
+    }
+  ]
+}

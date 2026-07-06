@@ -1,324 +1,566 @@
-"""A small manual ReAct loop with observable model and tool steps."""
+"""User-facing coordinator for the framework-free multi-agent system."""
 
-# Import JSON to place structured tool evidence into the final synthesis prompt.
+# Import JSON for isolated final synthesis prompts.
 import json
-# Import UTC-aware timestamps for trace records.
+# Import bounded parallel execution for independent specialists.
+from concurrent.futures import ThreadPoolExecutor, as_completed
+# Import UTC-aware timestamps for trajectories.
 from datetime import datetime, timezone
-# Import timing helpers for latency measurements and one provider retry.
+# Import timing helpers for latency and provider retries.
 from time import perf_counter, sleep
-# Import UUID generation for session, turn, trace, and step identifiers.
+# Import UUID generation for trace events.
 from uuid import uuid4
 
-# Import the official Google Gen AI client.
+# Import the Gemini SDK.
 from google import genai
-# Import provider errors and typed request objects used by the Gemini API.
+# Import provider errors and typed content objects.
 from google.genai import errors, types
 
-# Import the system policy.
-from .prompt import SYSTEM_PROMPT
-# Import persistent storage helpers.
+# Import the specialist registry and delegation schemas.
+from .agents import AGENT_SPECS, DELEGATION_DECLARATIONS, DELEGATION_TO_AGENT
+# Import the coordinator's routing instructions.
+from .prompt import COORDINATOR_PROMPT
+# Import the reusable specialist runtime and shared token normalizer.
+from .runtime import now, run_specialist, token_usage
+# Import conversation and trajectory persistence.
 from .store import append_trajectory, load_session, save_session
-# Import the executable allowlist and model-visible schemas.
-from .tools import TOOL_DECLARATIONS, TOOL_FUNCTIONS
+# Import optional Phoenix export.
+from .telemetry import export_trajectory
 
-# Allow two rounds of evidence gathering before mandatory synthesis.
-MAX_TOOL_ROUNDS = 2
-# Reserve one final model call that cannot request another tool.
-MAX_MODEL_CALLS = MAX_TOOL_ROUNDS + 1
-# Retry one provider-side failure after the SDK's own internal retries finish.
+# Permit at most two rounds of coordinator delegation.
+MAX_DELEGATION_ROUNDS = 2
+# Reserve one final tool-free synthesis call.
+MAX_COORDINATOR_CALLS = MAX_DELEGATION_ROUNDS + 1
+# Limit total specialist invocations in one user turn.
+MAX_SPECIALIST_INVOCATIONS = 3
+# Bound focused task and context fields independently.
+MAX_DELEGATION_TEXT_BYTES = 2 * 1024
+# Retry one provider-side failure after SDK retries.
 MODEL_API_ATTEMPTS = 2
 
 
-# Return an ISO timestamp that is unambiguous across time zones.
-def now() -> str:
-    """Return the current UTC time in ISO 8601 format."""
-    # Use UTC so traces from different machines remain comparable.
-    return datetime.now(timezone.utc).isoformat()
-
-
-# Convert our simple stored messages into Gemini content objects.
+# Convert stored public messages into Gemini contents.
 def history_to_contents(messages: list[dict]) -> list[types.Content]:
-    """Translate public session messages into Gemini's user/model history."""
-    # Start with an empty API history.
+    """Translate public user and assistant messages into Gemini roles."""
+    # Start with an empty provider history.
     contents = []
-    # Visit messages in their original chronological order.
+    # Preserve chronological order.
     for message in messages:
-        # Gemini calls assistant messages "model" messages.
-        role = "model" if message["role"] == "assistant" else "user"
-        # Tool details are stored for humans but excluded from later chat context.
+        # Ignore any legacy persisted tool records.
         if message["role"] == "tool":
-            # Skip because each completed turn already has an assistant summary.
+            # Specialists are intentionally stateless.
             continue
-        # Add one text part for this public message.
+        # Translate assistant into Gemini's model role.
+        role = "model" if message["role"] == "assistant" else "user"
+        # Append one public text message.
         contents.append(types.Content(role=role, parts=[types.Part(text=message["content"])]))
-    # Return API-ready conversation history.
+    # Return provider-ready history.
     return contents
 
 
-# Read token counters without failing when a provider omits one.
-def token_usage(response) -> dict:
-    """Normalize Gemini usage metadata into stable names."""
-    # Read the optional metadata object.
-    usage = response.usage_metadata
-    # Return zeros when the provider does not report a field.
-    return {
-        "input_tokens": getattr(usage, "prompt_token_count", 0) or 0,
-        "output_tokens": getattr(usage, "candidates_token_count", 0) or 0,
-        "thinking_tokens": getattr(usage, "thoughts_token_count", 0) or 0,
-        "total_tokens": getattr(usage, "total_token_count", 0) or 0,
-    }
+# Enforce the focused delegation payload boundary without breaking UTF-8.
+def bounded_text(value: str) -> str:
+    """Return no more than two kilobytes of UTF-8 text."""
+    # Encode with a deterministic representation.
+    encoded = value.encode("utf-8")
+    # Preserve text that already fits.
+    if len(encoded) <= MAX_DELEGATION_TEXT_BYTES:
+        # Return it unchanged.
+        return value
+    # Decode a byte preview while dropping an incomplete final code point.
+    return encoded[:MAX_DELEGATION_TEXT_BYTES].decode("utf-8", errors="ignore")
 
 
-# Execute one complete user interaction.
-def run_turn(client: genai.Client, model: str, session_id: str, user_text: str) -> dict:
-    """Run the bounded model-tool loop and return the answer plus its trajectory."""
-    # Generate IDs at their correct scopes.
+# Remove internal runtime fields before returning results to the coordinator model.
+def public_specialist_result(result: dict) -> dict:
+    """Strip internal event transport from a specialist result."""
+    # Copy only public fields.
+    return {key: value for key, value in result.items() if not key.startswith("_")}
+
+
+# Aggregate trusted artifact metadata from specialist results.
+def collect_turn_artifacts(results: list[dict]) -> list[dict]:
+    """Return unique artifacts keyed by host path."""
+    # Index by validated host path.
+    by_path = {}
+    # Visit each specialist result.
+    for result in results:
+        # Visit its artifacts.
+        for artifact in result.get("artifacts", []):
+            # Read the trusted path.
+            path = artifact.get("path")
+            # Preserve only path-bearing artifacts.
+            if path:
+                # Keep one copy.
+                by_path[path] = artifact
+    # Return stable insertion order.
+    return list(by_path.values())
+
+
+# Call the coordinator model with one explicit retry policy.
+def call_coordinator_model(
+    client: genai.Client,
+    model: str,
+    contents: list[types.Content],
+    config: types.GenerateContentConfig,
+    call_number: int,
+    trace_id: str,
+    events: list[dict],
+) -> object | None:
+    """Return a model response or record a terminal provider error."""
+    # Start granular provider timing.
+    started = perf_counter()
+    # Retry one server-side error.
+    for attempt in range(1, MODEL_API_ATTEMPTS + 1):
+        # Convert Gemini errors into trajectory events.
+        try:
+            # Execute the coordinator request.
+            return client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+        # Catch documented API failures.
+        except errors.APIError as error:
+            # Record the failed request.
+            events.append(
+                {
+                    "step_id": str(uuid4()),
+                    "trace_id": trace_id,
+                    "parent_step_id": None,
+                    "agent_name": "coordinator",
+                    "agent_run_id": trace_id,
+                    "depth": 0,
+                    "type": "model_error",
+                    "number": call_number,
+                    "attempt": attempt,
+                    "status_code": error.code,
+                    "error": str(error),
+                    "latency_ms": round((perf_counter() - started) * 1000, 2),
+                    "timestamp": now(),
+                }
+            )
+            # Retry only server failures with an attempt remaining.
+            if error.code >= 500 and attempt < MODEL_API_ATTEMPTS:
+                # Pause briefly before retrying.
+                sleep(1)
+                # Repeat the request.
+                continue
+            # Signal terminal provider failure.
+            return None
+    # Guard against unexpected retry-loop fallthrough.
+    return None
+
+
+# Execute one complete multi-agent user turn.
+def run_turn(api_key: str, model: str, session_id: str, user_text: str) -> dict:
+    """Route, delegate, synthesize, persist, and return one user-facing answer."""
+    # Generate turn and trace identities.
     turn_id = str(uuid4())
-    # A trace groups every operation required for this turn.
+    # Use one trace across coordinator and specialists.
     trace_id = str(uuid4())
-    # Load previous public turns to provide multi-turn context.
+    # Create the coordinator's private client.
+    client = genai.Client(api_key=api_key)
+    # Load only public conversation memory.
     saved_messages = load_session(session_id)
-    # Convert stored messages and add the new user message.
+    # Convert public history.
     contents = history_to_contents(saved_messages)
-    # Represent the new input in Gemini's content format.
-    user_content = types.Content(role="user", parts=[types.Part(text=user_text)])
-    # Add it to the API conversation.
-    contents.append(user_content)
-    # Start the append-only list of observable execution events.
+    # Add this user message.
+    contents.append(types.Content(role="user", parts=[types.Part(text=user_text)]))
+    # Start hierarchical trajectory collection.
     events = []
-    # Keep bounded tool observations for a fresh, tool-free synthesis request.
-    gathered_evidence = []
-    # Start measuring end-to-end turn latency.
+    # Collect public specialist outputs for final synthesis.
+    specialist_results = []
+    # Track the global delegation budget.
+    specialist_invocations = 0
+    # Prevent redundant use of the same specialist across coordinator rounds.
+    used_agents_this_turn = set()
+    # Start end-to-end turn timing.
     turn_started = perf_counter()
-    # Prepare function schemas while disabling hidden automatic execution.
-    config = types.GenerateContentConfig(
-        # Apply durable behavior separately from conversation data.
-        system_instruction=SYSTEM_PROMPT,
-        # Give the model the two function declarations.
-        tools=[types.Tool(function_declarations=TOOL_DECLARATIONS)],
-        # Keep orchestration in our code so every call is observable.
+    # Give the coordinator only agent-as-tool declarations.
+    delegation_config = types.GenerateContentConfig(
+        system_instruction=COORDINATOR_PROMPT,
+        tools=[types.Tool(function_declarations=DELEGATION_DECLARATIONS)],
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
-    # Prepare a final configuration containing no function declarations.
+    # Build a final configuration with no delegation tools.
     final_config = types.GenerateContentConfig(
-        # Preserve the durable policy while explicitly ending evidence gathering.
         system_instruction=(
-            SYSTEM_PROMPT
-            + "\nTool gathering is complete. Answer now using the available evidence. "
-            + "Do not request another tool."
-        ),
+            COORDINATOR_PROMPT
+            + "\nDelegation is complete. Synthesize the final user-facing answer now."
+        )
     )
-    # Make at most the configured number of model calls.
-    for model_call_number in range(1, MAX_MODEL_CALLS + 1):
-        # Remove tools on the last call so the loop must terminate with synthesis.
-        current_config = config if model_call_number <= MAX_TOOL_ROUNDS else final_config
-        # Use normal function-call history only while gathering evidence.
-        if model_call_number <= MAX_TOOL_ROUNDS:
-            # Preserve Gemini's exact model and function-response sequence.
+    # Run bounded coordinator rounds.
+    for call_number in range(1, MAX_COORDINATOR_CALLS + 1):
+        # Keep delegation enabled for two rounds.
+        delegating = call_number <= MAX_DELEGATION_ROUNDS
+        # Select the matching configuration.
+        current_config = delegation_config if delegating else final_config
+        # Preserve native function history only during delegation.
+        if delegating:
+            # Send public history plus coordinator delegation history.
             request_contents = contents
         else:
-            # Create a fresh text-only request so prior tool-call syntax cannot continue the loop.
-            synthesis_prompt = (
-                f"User question:\n{user_text}\n\n"
-                f"Retrieved evidence:\n{json.dumps(gathered_evidence, ensure_ascii=False)}\n\n"
-                "Answer the user directly. Cite repository-relative file paths and line numbers "
-                "when the evidence contains them. For a question asking where something is stored, "
-                "identify the most relevant matching file instead of merely summarizing a line."
+            # Isolate synthesis from function-call momentum.
+            synthesis_text = (
+                f"User request:\n{user_text}\n\n"
+                f"Specialist results:\n{json.dumps(specialist_results, ensure_ascii=False)}\n\n"
+                "Answer directly, preserve exact evidence and host artifact paths, "
+                "and disclose any specialist failure."
             )
-            # Send only ordinary user text with no tool declarations.
+            # Send a fresh text-only synthesis request.
             request_contents = [
-                types.Content(role="user", parts=[types.Part(text=synthesis_prompt)])
+                types.Content(role="user", parts=[types.Part(text=synthesis_text)])
             ]
-        # Record when this individual model request begins.
+        # Start coordinator-call timing.
         model_started = perf_counter()
-        # Start without a response so the retry loop can populate it.
-        response = None
-        # Make one extra attempt only after a provider API failure.
-        for api_attempt in range(1, MODEL_API_ATTEMPTS + 1):
-            # Convert provider failures into trace events instead of crashing the CLI.
-            try:
-                # Ask Gemma either to answer or, when enabled, select a declared tool.
-                response = client.models.generate_content(
-                    model=model,
-                    contents=request_contents,
-                    config=current_config,
-                )
-                # Leave the retry loop after a successful provider response.
-                break
-            # Catch documented Gemini API errors such as HTTP 500.
-            except errors.APIError as error:
-                # Record the failed provider interaction at its true granularity.
-                events.append(
-                    {
-                        "step_id": str(uuid4()),
-                        "type": "model_error",
-                        "number": model_call_number,
-                        "attempt": api_attempt,
-                        "status_code": error.code,
-                        "error": str(error),
-                        "latency_ms": round((perf_counter() - model_started) * 1000, 2),
-                        "timestamp": now(),
-                    }
-                )
-                # Retry only server-side failures and only when an attempt remains.
-                if error.code >= 500 and api_attempt < MODEL_API_ATTEMPTS:
-                    # Wait briefly to avoid immediately hitting the same transient condition.
-                    sleep(1)
-                    # Try the same model interaction again.
-                    continue
-                # Build a concise response that keeps the terminal session alive.
-                answer = "Gemini could not complete this turn. Please try the question again."
-                # Record the failed trajectory without adding it to conversation memory.
-                trajectory = {
-                    "session_id": session_id,
-                    "turn_id": turn_id,
-                    "trace_id": trace_id,
-                    "started_at": events[0]["timestamp"],
-                    "finished_at": now(),
-                    "latency_ms": round((perf_counter() - turn_started) * 1000, 2),
-                    "events": events,
-                    "total_tokens": 0,
-                    "status": "provider_error",
-                }
-                # Persist the failure for debugging and reliability analysis.
-                append_trajectory(trajectory)
-                # Return normally instead of exposing a Python traceback.
-                return {"answer": answer, "trajectory": trajectory}
-        # Guard against an impossible missing response after the retry loop.
+        # Execute the coordinator model call.
+        response = call_coordinator_model(
+            client,
+            model,
+            request_contents,
+            current_config,
+            call_number,
+            trace_id,
+            events,
+        )
+        # Return gracefully when provider retries are exhausted.
         if response is None:
-            # Raise a local programming error rather than using an undefined response.
-            raise RuntimeError("The model retry loop ended without a response.")
-        # Measure only the model API request.
-        model_latency_ms = round((perf_counter() - model_started) * 1000, 2)
-        # Read the function calls, defaulting to an empty list.
+            # Build a stable user-facing failure.
+            answer = "Gemini could not complete this turn. Please try the question again."
+            # Finish without adding a failed turn to public memory.
+            return finish_turn(
+                session_id,
+                turn_id,
+                trace_id,
+                answer,
+                user_text,
+                saved_messages,
+                events,
+                specialist_results,
+                turn_started,
+                "provider_error",
+                save_messages=False,
+            )
+        # Read requested agent delegations.
         function_calls = response.function_calls or []
-        # Add the model operation to the trace without private reasoning text.
+        # Give this coordinator operation a stable step ID.
+        coordinator_step_id = str(uuid4())
+        # Record the successful coordinator operation.
         events.append(
             {
-                "step_id": str(uuid4()),
+                "step_id": coordinator_step_id,
+                "trace_id": trace_id,
+                "parent_step_id": None,
+                "agent_name": "coordinator",
+                "agent_run_id": trace_id,
+                "depth": 0,
                 "type": "model_call",
-                "number": model_call_number,
-                "decision": "call_tool" if function_calls else "final_answer",
+                "number": call_number,
+                "decision": "delegate" if function_calls else "final_answer",
                 "tool_names": [call.name for call in function_calls],
-                "latency_ms": model_latency_ms,
+                "latency_ms": round((perf_counter() - model_started) * 1000, 2),
                 "tokens": token_usage(response),
                 "timestamp": now(),
             }
         )
-        # Finish when the model produced ordinary text instead of a tool request.
+        # Finish when the coordinator produces prose.
         if not function_calls:
-            # Read the final public answer.
-            answer = response.text or "The model returned no text."
-            # Add the user message to durable public history.
-            saved_messages.append({"role": "user", "content": user_text, "turn_id": turn_id})
-            # Add the assistant answer to durable public history.
-            saved_messages.append({"role": "assistant", "content": answer, "turn_id": turn_id})
-            # Save multi-turn context for a later process invocation.
-            save_session(session_id, saved_messages)
-            # Construct the complete trajectory record.
-            trajectory = {
-                "session_id": session_id,
-                "turn_id": turn_id,
-                "trace_id": trace_id,
-                "started_at": events[0]["timestamp"],
-                "finished_at": now(),
-                "latency_ms": round((perf_counter() - turn_started) * 1000, 2),
-                "events": events,
-                "total_tokens": sum(event.get("tokens", {}).get("total_tokens", 0) for event in events),
-                "status": "completed",
-            }
-            # Persist the trace independently from the chat history.
-            append_trajectory(trajectory)
-            # Return both useful output and inspection metadata.
-            return {"answer": answer, "trajectory": trajectory}
-        # Preserve the exact model content, including its function-call IDs.
+            # Normalize empty text.
+            answer = response.text or "The coordinator returned no text."
+            # Persist and return the completed turn.
+            return finish_turn(
+                session_id,
+                turn_id,
+                trace_id,
+                answer,
+                user_text,
+                saved_messages,
+                events,
+                specialist_results,
+                turn_started,
+                "completed",
+            )
+        # Do not execute malformed delegation calls during final synthesis.
+        if not delegating:
+            # Leave the loop for controlled termination.
+            break
+        # Preserve the exact coordinator function-call content.
         contents.append(response.candidates[0].content)
-        # Collect all tool responses into one user-role content message.
-        function_response_parts = []
-        # Execute every requested tool call in order.
-        for call in function_calls:
-            # Begin measuring this individual tool.
-            tool_started = perf_counter()
-            # Reject any function name outside the explicit allowlist.
-            tool = TOOL_FUNCTIONS.get(call.name)
-            # Prepare a safe result for an unknown function.
-            if tool is None:
-                # Do not use eval or dynamically import model-provided names.
-                result = {"ok": False, "error": f"Unknown tool: {call.name}"}
-            else:
-                # Convert provider arguments into an ordinary dictionary.
-                arguments = dict(call.args or {})
-                # Catch tool failures so the model can explain or recover.
-                try:
-                    # Execute only the allowlisted function.
-                    result = tool(**arguments)
-                # Convert expected and unexpected tool failures into observations.
-                except Exception as error:
-                    # Avoid crashing the entire session on one network failure.
-                    result = {"ok": False, "error": str(error)}
-            # Measure the tool independently from model latency.
-            tool_latency_ms = round((perf_counter() - tool_started) * 1000, 2)
-            # Add a transparent tool event without secrets.
+        # Track one invocation per specialist in this round.
+        seen_agents = set()
+        # Keep work records aligned with original function calls.
+        work_items = []
+        # Validate every requested delegation.
+        for index, call in enumerate(function_calls):
+            # Resolve the specialist identity from the explicit registry.
+            agent_name = DELEGATION_TO_AGENT.get(call.name)
+            # Normalize model arguments.
+            arguments = dict(call.args or {})
+            # Prepare a rejection reason when needed.
+            rejection = None
+            # Reject unknown delegation names.
+            if agent_name is None:
+                # Set the typed reason.
+                rejection = f"Unknown delegation tool: {call.name}"
+            # Reject duplicate use of one specialist in the same round.
+            elif agent_name in seen_agents:
+                # Set the typed reason.
+                rejection = f"{agent_name} may run only once per delegation round."
+            # Reject repeated use of a specialist elsewhere in this turn.
+            elif agent_name in used_agents_this_turn:
+                # The specialist already had its own two internal tool rounds.
+                rejection = f"{agent_name} may run only once per user turn."
+            # Enforce the global invocation budget.
+            elif specialist_invocations >= MAX_SPECIALIST_INVOCATIONS:
+                # Set the typed reason.
+                rejection = "The turn reached its specialist invocation limit."
+            # Record a rejected call without starting a specialist.
+            if rejection:
+                # Store a public rejected result.
+                result = {
+                    "agent": agent_name or "unknown",
+                    "agent_run_id": None,
+                    "status": "rejected",
+                    "answer": "",
+                    "evidence": [],
+                    "artifacts": [],
+                    "tokens": {"input": 0, "output": 0, "thinking": 0, "total": 0},
+                    "latency_ms": 0,
+                    "error": rejection,
+                }
+                # Keep it in coordinator evidence.
+                specialist_results.append(result)
+                # Preserve its original position.
+                work_items.append(
+                    {
+                        "index": index,
+                        "call": call,
+                        "result": result,
+                        "future": None,
+                        "delegation_step_id": None,
+                    }
+                )
+                # Continue validating other calls.
+                continue
+            # Mark this specialist used in the current round.
+            seen_agents.add(agent_name)
+            # Mark this specialist used for the complete turn.
+            used_agents_this_turn.add(agent_name)
+            # Consume one global invocation slot.
+            specialist_invocations += 1
+            # Resolve the immutable specialist spec.
+            spec = AGENT_SPECS[agent_name]
+            # Bound the focused task.
+            task = bounded_text(str(arguments.get("task", "")))
+            # Bound optional brief context.
+            context = bounded_text(str(arguments.get("context", "")))
+            # Create the parent delegation step.
+            delegation_step_id = str(uuid4())
+            # Record fan-out start before launching work.
             events.append(
                 {
-                    "step_id": str(uuid4()),
-                    "type": "tool_call",
-                    "tool": call.name,
-                    "arguments": dict(call.args or {}),
-                    "result": result,
-                    "latency_ms": tool_latency_ms,
+                    "step_id": delegation_step_id,
+                    "trace_id": trace_id,
+                    "parent_step_id": coordinator_step_id,
+                    "agent_name": "coordinator",
+                    "agent_run_id": trace_id,
+                    "target_agent": agent_name,
+                    "depth": 0,
+                    "type": "delegation_start",
+                    "task": task,
+                    "context": context,
                     "timestamp": now(),
                 }
             )
-            # Preserve the bounded observation for the final isolated synthesis call.
-            gathered_evidence.append(
+            # Store validated work for concurrent launch.
+            work_items.append(
                 {
-                    "tool": call.name,
-                    "arguments": dict(call.args or {}),
-                    "result": result,
+                    "index": index,
+                    "call": call,
+                    "spec": spec,
+                    "task": task,
+                    "context": context,
+                    "delegation_step_id": delegation_step_id,
                 }
             )
-            # Construct the function response tied to the model's call ID.
+        # Select only accepted work.
+        accepted = [item for item in work_items if item.get("delegation_step_id")]
+        # Run same-response specialists concurrently with separate clients.
+        with ThreadPoolExecutor(max_workers=min(3, max(1, len(accepted)))) as executor:
+            # Map futures back to work records.
+            future_to_item = {
+                executor.submit(
+                    run_specialist,
+                    api_key,
+                    model,
+                    item["spec"],
+                    item["task"],
+                    item["context"],
+                    trace_id,
+                    item["delegation_step_id"],
+                ): item
+                for item in accepted
+            }
+            # Consume results as specialists finish.
+            for future in as_completed(future_to_item):
+                # Recover the associated call.
+                item = future_to_item[future]
+                # Convert unexpected worker failures into structured results.
+                try:
+                    # Read the specialist result.
+                    internal_result = future.result()
+                # Isolate a worker exception from the whole turn.
+                except Exception as error:
+                    # Build the common failed shape.
+                    internal_result = {
+                        "agent": item["spec"].name,
+                        "agent_run_id": str(uuid4()),
+                        "status": "internal_error",
+                        "answer": "",
+                        "evidence": [],
+                        "artifacts": [],
+                        "tokens": {"input": 0, "output": 0, "thinking": 0, "total": 0},
+                        "latency_ms": 0,
+                        "error": str(error),
+                        "_events": [],
+                    }
+                # Attach specialist events beneath the delegation step.
+                events.extend(internal_result.get("_events", []))
+                # Strip transport-only fields before coordinator ingestion.
+                result = public_specialist_result(internal_result)
+                # Store the public result on its work item.
+                item["result"] = result
+                # Add it to final synthesis evidence.
+                specialist_results.append(result)
+                # Record fan-in completion.
+                events.append(
+                    {
+                        "step_id": str(uuid4()),
+                        "trace_id": trace_id,
+                        "parent_step_id": item["delegation_step_id"],
+                        "agent_name": "coordinator",
+                        "agent_run_id": trace_id,
+                        "target_agent": result["agent"],
+                        "target_agent_run_id": result["agent_run_id"],
+                        "depth": 0,
+                        "type": "delegation_end",
+                        "status": result["status"],
+                        "latency_ms": result["latency_ms"],
+                        "timestamp": now(),
+                    }
+                )
+        # Build function responses in the original model-call order.
+        function_response_parts = []
+        # Sort by original call position.
+        for item in sorted(work_items, key=lambda value: value["index"]):
+            # Read the public result.
+            result = item["result"]
+            # Tie the agent result to the coordinator's call ID.
             function_response_parts.append(
-                # Build the nested object directly because the SDK helper does not accept an ID.
                 types.Part(
-                    # Keep the ID so Gemini can match this result to its original request.
                     function_response=types.FunctionResponse(
-                        # Copy the model-generated function name.
-                        name=call.name,
-                        # Copy the model-generated call ID.
-                        id=call.id,
-                        # Wrap the tool result in a stable response property.
+                        name=item["call"].name,
+                        id=item["call"].id,
                         response={"result": result},
                     )
                 )
             )
-        # Return all tool observations to the model for its next decision.
+        # Return all specialist results to the coordinator.
         contents.append(types.Content(role="user", parts=function_response_parts))
-    # Produce a controlled response only if the mandatory synthesis call was malformed.
-    answer = "I gathered evidence but could not produce a final answer."
-    # Save the user's input and controlled assistant response.
-    saved_messages.extend(
-        [
-            {"role": "user", "content": user_text, "turn_id": turn_id},
-            {"role": "assistant", "content": answer, "turn_id": turn_id},
-        ]
+    # Return a controlled answer only if final synthesis remains malformed.
+    answer = "The coordinator reached its delegation limit without a final answer."
+    # Persist the bounded termination.
+    return finish_turn(
+        session_id,
+        turn_id,
+        trace_id,
+        answer,
+        user_text,
+        saved_messages,
+        events,
+        specialist_results,
+        turn_started,
+        "step_limit_reached",
     )
-    # Persist the bounded-loop result.
-    save_session(session_id, saved_messages)
-    # Record the stopped trajectory.
+
+
+# Build, persist, and return one top-level turn result.
+def finish_turn(
+    session_id: str,
+    turn_id: str,
+    trace_id: str,
+    answer: str,
+    user_text: str,
+    saved_messages: list[dict],
+    events: list[dict],
+    specialist_results: list[dict],
+    turn_started: float,
+    status: str,
+    save_messages: bool = True,
+) -> dict:
+    """Finalize public memory, aggregate metrics, and append the trajectory."""
+    # Persist only successful or controlled public turns.
+    if save_messages:
+        # Add the user input.
+        saved_messages.append({"role": "user", "content": user_text, "turn_id": turn_id})
+        # Add only the coordinator's final answer.
+        saved_messages.append({"role": "assistant", "content": answer, "turn_id": turn_id})
+        # Save coordinator-owned public history.
+        save_session(session_id, saved_messages)
+    # Initialize whole-turn token counters.
+    token_totals = {"input": 0, "output": 0, "thinking": 0, "total": 0}
+    # Aggregate all coordinator and specialist model calls exactly once.
+    for event in events:
+        # Read optional model usage.
+        usage = event.get("tokens", {})
+        # Sum each normalized field.
+        for key in token_totals:
+            # Default absent values to zero.
+            token_totals[key] += usage.get(key, 0)
+    # Aggregate trusted artifacts from specialist results.
+    artifacts = collect_turn_artifacts(specialist_results)
+    # Build a concise per-agent summary.
+    agent_summaries = [
+        {
+            "agent": result["agent"],
+            "agent_run_id": result["agent_run_id"],
+            "status": result["status"],
+            "tokens": result["tokens"],
+            "latency_ms": result["latency_ms"],
+        }
+        # Preserve completion order to reflect fan-in.
+        for result in specialist_results
+    ]
+    # Construct the hierarchical trajectory.
     trajectory = {
         "session_id": session_id,
         "turn_id": turn_id,
         "trace_id": trace_id,
-        "started_at": events[0]["timestamp"],
+        "started_at": events[0]["timestamp"] if events else now(),
         "finished_at": now(),
         "latency_ms": round((perf_counter() - turn_started) * 1000, 2),
         "events": events,
-        "total_tokens": sum(event.get("tokens", {}).get("total_tokens", 0) for event in events),
-        "status": "step_limit_reached",
+        "agent_summaries": agent_summaries,
+        "tokens": token_totals,
+        "total_tokens": token_totals["total"],
+        "status": status,
     }
-    # Append the stopped trace for debugging.
+    # Export the completed hierarchy without making Phoenix a runtime dependency.
+    phoenix_trace_id = export_trajectory(
+        trajectory,
+        user_text,
+        answer,
+        specialist_results,
+    )
+    # Store the cross-system ID in the JSONL source of truth.
+    trajectory["phoenix_trace_id"] = phoenix_trace_id
+    # Append one turn-level JSON Lines record.
     append_trajectory(trajectory)
-    # Return the controlled answer and evidence.
-    return {"answer": answer, "trajectory": trajectory}
+    # Return public answer, artifacts, and observability metadata.
+    return {
+        "answer": answer,
+        "artifacts": artifacts,
+        "phoenix_trace_id": phoenix_trace_id,
+        "trajectory": trajectory,
+    }
