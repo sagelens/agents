@@ -6,8 +6,30 @@ The `agents-dev` project shows interactive traces. The `agents-evals` project
 stores traces from deliberate offline experiments. Evaluation never runs after
 a normal user turn.
 
+## Run and edit evaluations from the local UI
+
+Start the application and open the **Evaluations** tab:
+
+```bash
+python main.py
+open http://localhost:9999
+```
+
+The UI can browse and select JSONL examples, apply a quick-run limit, enable
+the optional LLM judge, and launch the real Phoenix experiment in a background
+operation. Completed runs show the experiment name, selected IDs, model, and
+Phoenix URL.
+
+The **Dataset Builder** tab creates examples with expected route, agents,
+tools, reference behavior, category, and difficulty. It validates unique
+stable IDs and atomically updates `evals/dataset.jsonl`; the same dataset
+continues to work with the CLI.
+
 For the function-by-function implementation path, read
 [How Phoenix evaluations work internally](EVAL_INTERNALS.md).
+For a concrete interpretation of the latest 20-example run, including every
+row, aggregate score, trace-ID layer, evaluator blind spot, and failure cause,
+read [Latest Phoenix experiment analysis](PHOENIX_LATEST_EXPERIMENT_ANALYSIS.md).
 
 ## What Phoenix is, in plain language
 

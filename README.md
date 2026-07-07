@@ -32,6 +32,9 @@ For visual traces and offline agent evaluations, read
 [docs/EVALUATIONS.md](docs/EVALUATIONS.md). For the low-level call path from
 dataset loading through Phoenix REST persistence, read
 [docs/EVAL_INTERNALS.md](docs/EVAL_INTERNALS.md).
+For a row-by-row analysis of the latest 20-example Phoenix run, including why
+green routing scores coexist with provider failures, read
+[docs/PHOENIX_LATEST_EXPERIMENT_ANALYSIS.md](docs/PHOENIX_LATEST_EXPERIMENT_ANALYSIS.md).
 
 ## Setup
 
@@ -81,6 +84,11 @@ python main.py
 open http://localhost:6006
 python -m evals.run --limit 2
 ```
+
+The local GUI also provides **Evaluations** and **Dataset Builder** tabs for
+selecting examples, running Phoenix experiments, reviewing the expanded
+20-example suite, and creating new JSONL examples without editing files by
+hand.
 
 The grep tool requires ripgrep:
 
@@ -178,6 +186,10 @@ Gemma-to-Flash fallback, source merging, recursive memory updates, and a
 detailed explanation of dynamic compaction in agent harnesses, read
 [docs/DEEP_RESEARCH_TRACE_AND_COMPACTION.md](docs/DEEP_RESEARCH_TRACE_AND_COMPACTION.md).
 
+For interview preparation tailored to a Google Senior Software Engineer,
+AI/ML role, read
+[docs/GOOGLE_SENIOR_AIML_INTERVIEW_100_QA.md](docs/GOOGLE_SENIOR_AIML_INTERVIEW_100_QA.md).
+
 ## Resume screening
 
 After sharing the configured Drive folder and spreadsheet with the service
@@ -216,6 +228,12 @@ For a grounded comparison of Google ADK collaboration modes, handoffs,
 Agent2Agent communication, HITL confirmation, and resumability against this
 framework-free implementation, see
 [docs/GOOGLE_ADK_COMPARISON.md](docs/GOOGLE_ADK_COMPARISON.md).
+
+For an exhaustive beginner-first explanation of Phoenix tracing, datasets,
+experiments, evaluators, the local server, CLI/UI execution, score
+interpretation, troubleshooting, privacy, and this codebase's complete call
+path, read
+[docs/PHOENIX_EVALS_ZERO_TO_HERO.md](docs/PHOENIX_EVALS_ZERO_TO_HERO.md).
 
 The resume prompt-injection threat model, layered controls, and manual review
 workflow are documented in

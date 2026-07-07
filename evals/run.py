@@ -227,19 +227,48 @@ def make_judge(model: str):
     return gemma_judge
 
 
-# Parse commands and execute one Phoenix experiment.
-def main() -> None:
-    """Upload a dataset version and run the selected examples."""
-    # Define the small public command-line interface.
-    parser = argparse.ArgumentParser(description=__doc__)
-    # Support inexpensive quick runs.
-    parser.add_argument("--limit", type=int, help="Run only the first N selected examples.")
-    # Support named debugging runs.
-    parser.add_argument("--ids", help="Comma-separated stable example IDs.")
-    # Keep model judging explicitly opt-in.
-    parser.add_argument("--judge", action="store_true", help="Add Gemma qualitative evaluators.")
-    # Parse terminal arguments.
-    args = parser.parse_args()
+def append_example(example: dict) -> dict:
+    """Validate and atomically append one user-authored evaluation example."""
+    required = {"id", "prompt", "expected"}
+    if not required <= set(example):
+        raise ValueError("Example requires id, prompt, and expected.")
+    example_id = str(example["id"]).strip()
+    if not example_id or not example_id.replace("_", "").isalnum():
+        raise ValueError("Example ID may contain only letters, numbers, and underscores.")
+    prompt = str(example["prompt"]).strip()
+    expected = example["expected"]
+    if not prompt or not isinstance(expected, dict):
+        raise ValueError("Prompt must be non-empty and expected must be an object.")
+    if expected.get("mode") not in {"direct", "single", "parallel", "sequential"}:
+        raise ValueError("Expected mode must be direct, single, parallel, or sequential.")
+    for field in ("agents", "tools"):
+        if not isinstance(expected.get(field, []), list):
+            raise ValueError(f"Expected {field} must be an array.")
+    existing = load_examples(None, None)
+    if any(item["id"] == example_id for item in existing):
+        raise ValueError(f"Evaluation ID already exists: {example_id}")
+    normalized = {
+        "id": example_id,
+        "prompt": prompt[:8_000],
+        "expected": expected,
+        "metadata": example.get("metadata", {}),
+    }
+    temporary = DATASET_PATH.with_suffix(".tmp")
+    lines = [
+        json.dumps(item, ensure_ascii=False)
+        for item in [*existing, normalized]
+    ]
+    temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    temporary.replace(DATASET_PATH)
+    return normalized
+
+
+def run_evaluation(
+    selected_ids: set[str] | None = None,
+    limit: int | None = None,
+    judge_enabled: bool = False,
+) -> dict:
+    """Run the Phoenix experiment pipeline and return a UI-friendly summary."""
     # Load project-local configuration.
     load_dotenv()
     # Validate the existing Gemini configuration.
@@ -249,10 +278,8 @@ def main() -> None:
     # Resolve application and judge models.
     model = os.getenv("GEMINI_MODEL", "gemma-4-31b-it")
     judge_model = os.getenv("PHOENIX_EVAL_MODEL", model)
-    # Parse requested IDs.
-    selected_ids = set(args.ids.split(",")) if args.ids else None
     # Load the requested stable examples.
-    examples = load_examples(selected_ids, args.limit)
+    examples = load_examples(selected_ids, limit)
     # Connect to local Phoenix.
     base_url = os.getenv("PHOENIX_BASE_URL", "http://localhost:6006")
     client = Client(base_url=base_url)
@@ -270,7 +297,10 @@ def main() -> None:
     dataset = client.datasets.create_dataset(
         name=DATASET_NAME,
         examples=phoenix_examples,
-        dataset_description="Twelve routing, tool, path, artifact, and safety examples.",
+        dataset_description=(
+            f"{len(phoenix_examples)} routing, tool, dependency, artifact, "
+            "robustness, grounding, and safety examples."
+        ),
     )
     # Export evaluated application traces to their separate project.
     os.environ["PHOENIX_ENABLED"] = "true"
@@ -278,7 +308,7 @@ def main() -> None:
     # Always include deterministic report-only scoring.
     evaluators = [deterministic_evaluator]
     # Add an explicitly requested, potentially biased LLM judge.
-    if args.judge:
+    if judge_enabled:
         evaluators.append(make_judge(judge_model))
     # Use a timestamp so repeated runs remain directly comparable.
     experiment_name = "agents-eval-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -290,7 +320,7 @@ def main() -> None:
             evaluators=evaluators,
             experiment_name=experiment_name,
             experiment_description="Framework-free multi-agent routing and quality evaluation.",
-            experiment_metadata={"judge_enabled": args.judge, "model": model},
+            experiment_metadata={"judge_enabled": judge_enabled, "model": model},
             print_summary=True,
             retries=0,
             timeout=120,
@@ -298,8 +328,36 @@ def main() -> None:
     finally:
         # Flush evaluated application traces even when an evaluator errors.
         shutdown_telemetry()
-    # Print the durable place to inspect scores and linked traces.
-    print(f"\nPhoenix: {base_url}  Experiment: {experiment_name}")
+    return {
+        "kind": "evaluation",
+        "status": "completed",
+        "experiment_name": experiment_name,
+        "dataset_name": DATASET_NAME,
+        "example_count": len(examples),
+        "selected_ids": [example["id"] for example in examples],
+        "judge_enabled": judge_enabled,
+        "model": model,
+        "phoenix_url": base_url,
+    }
+
+
+# Parse commands and execute one Phoenix experiment.
+def main() -> None:
+    """Upload a dataset version and run the selected examples."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--limit", type=int, help="Run only the first N selected examples.")
+    parser.add_argument("--ids", help="Comma-separated stable example IDs.")
+    parser.add_argument("--judge", action="store_true", help="Add Gemma qualitative evaluators.")
+    args = parser.parse_args()
+    result = run_evaluation(
+        selected_ids=set(args.ids.split(",")) if args.ids else None,
+        limit=args.limit,
+        judge_enabled=args.judge,
+    )
+    print(
+        f"\nPhoenix: {result['phoenix_url']}  "
+        f"Experiment: {result['experiment_name']}"
+    )
 
 
 # Execute only for python -m evals.run.

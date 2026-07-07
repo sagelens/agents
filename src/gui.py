@@ -83,6 +83,22 @@ INDEX_HTML = r"""<!doctype html>
     .log.FATAL { border-color:#ff3d65; background:#260d18; }
     .pill { padding:3px 7px; border-radius:999px; background:#1a2742; color:var(--muted);
       font-size:11px; }
+    .tabs { display:flex; gap:8px; margin-bottom:14px; position:sticky; top:0;
+      z-index:3; padding:4px; background:var(--bg); border-radius:11px; }
+    .tab { background:#17233d; color:var(--muted); }
+    .tab.active { background:var(--accent); color:#08101f; }
+    .view { display:none; }.view.active { display:block; }
+    .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    select { width:100%; padding:10px; color:var(--text); background:#0c1427;
+      border:1px solid var(--line); border-radius:9px; }
+    table { width:100%; border-collapse:collapse; font-size:12px; }
+    th,td { text-align:left; padding:9px; border-bottom:1px solid var(--line);
+      vertical-align:top; } th { color:var(--muted); position:sticky; top:0; background:var(--panel); }
+    .table-wrap { max-height:430px; overflow:auto; border:1px solid var(--line); border-radius:9px; }
+    .check-list { max-height:220px; overflow:auto; background:#0c1427;
+      border:1px solid var(--line); border-radius:9px; padding:9px; }
+    .check-list label { display:block; padding:5px; }.check-list input { width:auto; margin-right:8px; }
+    .result-card { white-space:pre-wrap; background:#09101e; border-radius:9px; padding:12px; }
     .hidden { display:none; }
     @media(max-width:1000px) {
       .layout,.layout.debug-collapsed { grid-template-columns:1fr; height:auto; }
@@ -103,6 +119,12 @@ INDEX_HTML = r"""<!doctype html>
   </aside>
 
   <main class="workspace">
+  <nav class="tabs">
+    <button class="tab active" data-view="agentView">Agent</button>
+    <button class="tab" data-view="evalView">Evaluations</button>
+    <button class="tab" data-view="datasetView">Dataset Builder</button>
+  </nav>
+  <div id="agentView" class="view active">
   <section class="panel" style="margin-top:0">
     <label for="query"><strong>What can the agents help with?</strong></label>
     <textarea id="query" placeholder="Ask any question, request analysis, inspect the codebase, or begin deep research..."></textarea>
@@ -123,6 +145,65 @@ INDEX_HTML = r"""<!doctype html>
     <strong id="answerTitle">Answer</strong>
     <div id="report"></div>
   </section>
+  </div>
+
+  <div id="evalView" class="view">
+    <section class="panel" style="margin-top:0">
+      <h2 style="margin-top:0">Phoenix Evaluations</h2>
+      <p class="muted">Run the real multi-agent application against selected examples and publish scores and traces to Phoenix.</p>
+      <div class="grid2">
+        <label>Run limit
+          <input id="evalLimit" type="number" min="1" placeholder="Blank runs selected examples">
+        </label>
+        <label>Qualitative judge
+          <select id="evalJudge"><option value="false">Deterministic evaluators only</option>
+            <option value="true">Include LLM-as-judge</option></select>
+        </label>
+      </div>
+      <p><strong>Select examples</strong></p>
+      <div id="evalChecks" class="check-list">Loading dataset…</div>
+      <div class="row">
+        <button id="runEval">Run Phoenix evaluation</button>
+        <span id="evalStatus" class="status">Ready</span>
+      </div>
+    </section>
+    <section id="evalResultPanel" class="panel hidden">
+      <strong>Experiment result</strong>
+      <div id="evalResult" class="result-card"></div>
+    </section>
+  </div>
+
+  <div id="datasetView" class="view">
+    <section class="panel" style="margin-top:0">
+      <h2 style="margin-top:0">Evaluation Dataset</h2>
+      <p class="muted">Browse committed examples or add a new routing/tool expectation from the UI.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>ID</th><th>Prompt</th><th>Route</th><th>Agents</th><th>Tools</th></tr></thead>
+        <tbody id="datasetRows"></tbody>
+      </table></div>
+    </section>
+    <section class="panel">
+      <h3 style="margin-top:0">Create example</h3>
+      <div class="grid2">
+        <label>Stable ID<input id="dsId" placeholder="my_new_example"></label>
+        <label>Expected mode<select id="dsMode">
+          <option>direct</option><option>single</option><option>parallel</option><option>sequential</option>
+        </select></label>
+      </div>
+      <label>Prompt<textarea id="dsPrompt" placeholder="The user request to evaluate"></textarea></label>
+      <div class="grid2">
+        <label>Expected agents<input id="dsAgents" placeholder="research_agent,data_science_agent"></label>
+        <label>Expected tools<input id="dsTools" placeholder="web_search,run_python"></label>
+      </div>
+      <label>Reference answer or behavior<textarea id="dsReference" placeholder="What a correct result should establish"></textarea></label>
+      <div class="grid2">
+        <label>Category<input id="dsCategory" placeholder="routing, safety, grounding"></label>
+        <label>Difficulty<select id="dsDifficulty"><option>easy</option><option selected>medium</option><option>hard</option></select></label>
+      </div>
+      <div class="row"><button id="saveExample">Save example</button>
+        <span id="datasetStatus" class="status"></span></div>
+    </section>
+  </div>
 
   </main>
 
@@ -135,6 +216,7 @@ INDEX_HTML = r"""<!doctype html>
 let runId = null, operationId = null, busy = false;
 let sessionId = localStorage.getItem("agentSessionId") || crypto.randomUUID();
 let latestLogSequence = 0, logCount = 0, lastState = null;
+let datasetExamples = [];
 localStorage.setItem("agentSessionId", sessionId);
 const $ = id => document.getElementById(id);
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -157,6 +239,32 @@ async function api(path, options={}) {
 
 function render(state) {
   lastState = state;
+  if (state.kind === "evaluation") {
+    $("evalStatus").textContent = "Completed";
+    $("runEval").disabled = false;
+    $("evalResultPanel").classList.remove("hidden");
+    $("evalResult").innerHTML = "";
+    [
+      ["Experiment", state.experiment_name],
+      ["Dataset", state.dataset_name],
+      ["Examples", state.example_count],
+      ["Model", state.model],
+      ["LLM judge", state.judge_enabled ? "enabled" : "disabled"]
+    ].forEach(([label, value]) => {
+      const line = document.createElement("div");
+      const strong = document.createElement("strong");
+      strong.textContent = label + ": ";
+      line.append(strong, document.createTextNode(String(value)));
+      $("evalResult").appendChild(line);
+    });
+    const link = document.createElement("a");
+    link.href = state.phoenix_url; link.target = "_blank"; link.rel = "noopener";
+    link.textContent = "Open experiment workspace in Phoenix";
+    link.style.color = "var(--accent)";
+    $("evalResult").appendChild(link);
+    renderDebug(state);
+    return;
+  }
   if (state.kind === "research") runId = state.run_id || runId;
   $("status").textContent = `${state.status || "running"}${state.route ? " · " + state.route : ""}`;
   $("choices").innerHTML = "";
@@ -209,7 +317,10 @@ async function pollOperation() {
       operationId = null; setBusy(false, "Completed"); render(operation.result); return;
     }
     if (operation.status === "failed") {
-      operationId = null; setBusy(false, "Failed"); throw new Error(operation.error);
+      operationId = null; setBusy(false, "Failed");
+      $("runEval").disabled = false;
+      $("evalStatus").textContent = "Failed";
+      throw new Error(operation.error);
     }
     if (runId) {
       try { render(await api(`/api/research/${runId}`)); } catch (_) {}
@@ -250,6 +361,88 @@ async function choose(optionNumber) {
 }
 
 $("start").onclick = start;
+$("runEval").onclick = async () => {
+  const ids = [...document.querySelectorAll("#evalChecks input:checked")].map(item => item.value);
+  const limitValue = $("evalLimit").value.trim();
+  $("runEval").disabled = true;
+  $("evalStatus").textContent = "Running real agent examples…";
+  try {
+    const operation = await api("/api/evals/run", {
+      method:"POST",
+      body:JSON.stringify({
+        ids,
+        limit:limitValue ? Number(limitValue) : null,
+        judge:$("evalJudge").value === "true"
+      })
+    });
+    operationId = operation.operation_id;
+    await pollOperation();
+  } catch (error) {
+    $("runEval").disabled = false;
+    $("evalStatus").textContent = "Error: " + error.message;
+  }
+};
+
+document.querySelectorAll(".tab").forEach(tabButton => {
+  tabButton.onclick = () => {
+    document.querySelectorAll(".tab").forEach(item => item.classList.remove("active"));
+    document.querySelectorAll(".view").forEach(item => item.classList.remove("active"));
+    tabButton.classList.add("active");
+    $(tabButton.dataset.view).classList.add("active");
+  };
+});
+
+function csv(value) {
+  return value.split(",").map(item => item.trim()).filter(Boolean);
+}
+
+function renderDataset(examples) {
+  datasetExamples = examples;
+  $("datasetRows").innerHTML = "";
+  $("evalChecks").innerHTML = "";
+  examples.forEach(example => {
+    const row = document.createElement("tr");
+    [example.id, example.prompt, example.expected.mode,
+      (example.expected.agents || []).join(", "),
+      (example.expected.tools || []).join(", ")].forEach(value => {
+        const cell = document.createElement("td"); cell.textContent = value; row.appendChild(cell);
+      });
+    $("datasetRows").appendChild(row);
+    const label = document.createElement("label");
+    const check = document.createElement("input");
+    check.type = "checkbox"; check.value = example.id; check.checked = true;
+    label.append(check, document.createTextNode(`${example.id} — ${example.prompt}`));
+    $("evalChecks").appendChild(label);
+  });
+}
+
+async function loadDataset() {
+  const result = await api("/api/evals/dataset");
+  renderDataset(result.examples);
+}
+
+$("saveExample").onclick = async () => {
+  $("datasetStatus").textContent = "Saving…";
+  try {
+    await api("/api/evals/dataset", {
+      method:"POST",
+      body:JSON.stringify({
+        id:$("dsId").value,
+        prompt:$("dsPrompt").value,
+        expected:{
+          mode:$("dsMode").value,
+          agents:csv($("dsAgents").value),
+          tools:csv($("dsTools").value),
+          reference:$("dsReference").value
+        },
+        metadata:{category:$("dsCategory").value, difficulty:$("dsDifficulty").value}
+      })
+    });
+    $("datasetStatus").textContent = "Saved";
+    await loadDataset();
+  } catch (error) { $("datasetStatus").textContent = "Error: " + error.message; }
+};
+
 $("debugToggle").onclick = () => {
   const collapsed = $("layout").classList.toggle("debug-collapsed");
   $("debugToggle").textContent = collapsed ? "⇥" : "⇤";
@@ -289,6 +482,7 @@ async function pollLogs() {
 }
 setInterval(pollLogs, 500);
 pollLogs();
+loadDataset().catch(error => { $("datasetStatus").textContent = "Error: " + error.message; });
 </script></body></html>"""
 
 
@@ -487,6 +681,12 @@ class AgentGuiHandler(BaseHTTPRequestHandler):
                 after = max(0, int(raw_after))
                 self._json(200, logs_after(after))
                 return
+            if path == "/api/evals/dataset":
+                from evals.run import load_examples
+
+                examples = load_examples(None, None)
+                self._json(200, {"examples": examples, "count": len(examples)})
+                return
             if path.startswith("/api/operations/"):
                 operation_id = path.rsplit("/", 1)[-1]
                 with LOCK:
@@ -526,6 +726,30 @@ class AgentGuiHandler(BaseHTTPRequestHandler):
                     session_id,
                 )
                 self._json(202, {"operation_id": operation_id})
+                return
+            if path == "/api/evals/run":
+                from evals.run import run_evaluation
+
+                raw_ids = payload.get("ids", [])
+                if not isinstance(raw_ids, list):
+                    raise ValueError("ids must be an array.")
+                selected_ids = {str(item) for item in raw_ids} or None
+                raw_limit = payload.get("limit")
+                limit = None if raw_limit in {None, ""} else max(1, min(int(raw_limit), 100))
+                judge = bool(payload.get("judge", False))
+                log(LOGGER, "INFO", "Phoenix evaluation requested",
+                    selected_count=len(selected_ids or []), limit=limit, judge=judge)
+                operation_id = _start_operation(
+                    lambda: run_evaluation(selected_ids, limit, judge)
+                )
+                self._json(202, {"operation_id": operation_id})
+                return
+            if path == "/api/evals/dataset":
+                from evals.run import append_example
+
+                example = append_example(payload)
+                log(LOGGER, "INFO", "Evaluation example created", example_id=example["id"])
+                self._json(201, {"example": example})
                 return
             if path == "/api/research/select":
                 run_id = str(payload.get("run_id", ""))
